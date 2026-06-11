@@ -1,0 +1,36 @@
+{
+  "report_generated_at": "2026-06-09",
+  "account_id": "081020446316",
+  "region": "us-east-1",
+  "total_jobs": 23,
+  "summary": {
+    "SUCCEEDED": 12,
+    "FAILED": 2,
+    "NO_RUNS": 9
+  },
+  "jobs": [
+    { "job_name": "LicenseManagerResourceSynDataProcessJob", "last_execution": "2026-06-08T22:36:48+05:30", "status": "SUCCEEDED" },
+    { "job_name": "INT-TX-Tracking-ETL-JOB",                "last_execution": "2026-05-15T15:36:47+05:30", "status": "SUCCEEDED" },
+    { "job_name": "INT-Booking-ETL-JOB",                    "last_execution": "2026-04-28T14:52:40+05:30", "status": "SUCCEEDED" },
+    { "job_name": "INT-TT-ETL-JOB",                         "last_execution": "2026-04-28T14:49:19+05:30", "status": "SUCCEEDED" },
+    { "job_name": "INT-SUBS-ETL-JOB",                       "last_execution": "2026-04-01T14:44:46+05:30", "status": "SUCCEEDED" },
+    { "job_name": "INT-SS-BKAGG-ETL-JOB",                   "last_execution": "2026-03-31T11:24:54+05:30", "status": "FAILED"    },
+    { "job_name": "INT-OV-ETL-JOB",                         "last_execution": "2026-03-18T12:43:34+05:30", "status": "SUCCEEDED" },
+    { "job_name": "INT-OS-ETL-JOB",                         "last_execution": "2026-01-29T15:04:02+05:30", "status": "SUCCEEDED" },
+    { "job_name": "INT-eBL-ETL-JOB",                        "last_execution": "2026-01-29T14:46:04+05:30", "status": "SUCCEEDED" },
+    { "job_name": "INT-WebBL-ETL-JOB",                      "last_execution": "2026-01-29T12:49:52+05:30", "status": "SUCCEEDED" },
+    { "job_name": "INT-OSNG-ETL-JOB",                       "last_execution": "2025-10-08T14:19:07+05:30", "status": "SUCCEEDED" },
+    { "job_name": "INT-OFAC-JOB",                           "last_execution": "2025-09-24T16:20:46+05:30", "status": "SUCCEEDED" },
+    { "job_name": "test_ofac",                              "last_execution": "2025-07-18T14:39:22+05:30", "status": "FAILED"    },
+    { "job_name": "Glue_EBL",                               "last_execution": null,                        "status": "NO_RUNS"   },
+    { "job_name": "INT-SI-ETL-JOB",                         "last_execution": null,                        "status": "NO_RUNS"   },
+    { "job_name": "INT-TX-BK-ETL-JOB",                      "last_execution": null,                        "status": "NO_RUNS"   },
+    { "job_name": "INT-TX-ETL-JOB",                         "last_execution": null,                        "status": "NO_RUNS"   },
+    { "job_name": "INT-XLOG-ETL-POC",                       "last_execution": null,                        "status": "NO_RUNS"   },
+    { "job_name": "TT_Glue_V2",                             "last_execution": null,                        "status": "NO_RUNS"   },
+    { "job_name": "agi002_glue_dev_nb",                     "last_execution": null,                        "status": "NO_RUNS"   },
+    { "job_name": "mve001_Glue_dev_ job",                   "last_execution": null,                        "status": "NO_RUNS"   },
+    { "job_name": "rsh003_glue_dev_nb",                     "last_execution": null,                        "status": "NO_RUNS"   },
+    { "job_name": "sos002_glue_dev_nb",                     "last_execution": null,                        "status": "NO_RUNS"   }
+  ]
+}

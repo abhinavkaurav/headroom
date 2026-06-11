@@ -97,7 +97,7 @@ class CompressConfig:
     """
 
     # What to compress
-    compress_user_messages: bool = False
+    compress_user_messages: bool = True
     """Compress user messages too (default: skip them for coding agents).
     Set True for document compression, RAG pipelines, or when user messages
     contain large tool outputs."""

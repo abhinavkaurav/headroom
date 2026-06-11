@@ -5564,10 +5564,20 @@ class OpenAIHandlerMixin:
             if protect_analysis_context is not None:
                 pipeline_kwargs["protect_analysis_context"] = bool(protect_analysis_context)
 
-            result = self.openai_pipeline.apply(
-                messages=messages,
-                model=model,
-                **pipeline_kwargs,
+            _pipeline_kwargs = pipeline_kwargs
+            _messages = messages
+            _model = model
+
+            def _run_pipeline():
+                return self.openai_pipeline.apply(
+                    messages=_messages,
+                    model=_model,
+                    **_pipeline_kwargs,
+                )
+
+            result = await self._run_compression_in_executor(
+                _run_pipeline,
+                timeout=float(COMPRESSION_TIMEOUT_SECONDS),
             )
 
             return JSONResponse(
@@ -5593,7 +5603,7 @@ class OpenAIHandlerMixin:
                 content={
                     "error": {
                         "type": "compression_error",
-                        "message": str(e),
+                        "message": str(e) or f"{type(e).__name__}",
                     }
                 },
             )

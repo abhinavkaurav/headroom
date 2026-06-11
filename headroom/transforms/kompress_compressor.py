@@ -49,6 +49,12 @@ _kompress_lock = threading.Lock()
 _execution_semaphores: dict[str, threading.BoundedSemaphore] = {}
 _execution_semaphores_lock = threading.Lock()
 
+# How long a thread waits to acquire _kompress_lock before giving up.
+# Prevents cascading timeouts: if a slow model download holds the lock for
+# 30+ seconds, subsequent threads fail fast (passthrough) instead of all
+# blocking and getting killed by the proxy's COMPRESSION_TIMEOUT_SECONDS.
+_KOMPRESS_LOAD_WAIT_TIMEOUT = 5.0
+
 
 def _selected_backend() -> KompressBackend:
     raw = os.environ.get(KOMPRESS_BACKEND_ENV, "auto").strip().lower().replace("-", "_")
@@ -325,7 +331,19 @@ def _load_kompress_onnx(
     import onnxruntime as ort
     from transformers import AutoTokenizer
 
-    with _kompress_lock:
+    # Fast path: already loaded, no lock needed.
+    if model_id in _kompress_cache:
+        return _kompress_cache[model_id]
+
+    # Acquire with timeout so threads don't pile up while a slow download
+    # holds the lock.  Callers have except-passthrough, so failing fast here
+    # keeps subsequent requests from cascading into 30s timeouts.
+    if not _kompress_lock.acquire(timeout=_KOMPRESS_LOAD_WAIT_TIMEOUT):
+        raise RuntimeError(
+            f"Kompress model {model_id!r} is being loaded by another thread; "
+            "skipping compression for this request"
+        )
+    try:
         if model_id in _kompress_cache:
             return _kompress_cache[model_id]
 
@@ -372,6 +390,8 @@ def _load_kompress_onnx(
         _kompress_cache[model_id] = (model, tokenizer, backend)
         logger.info("Kompress ONNX INT8 loaded: %s backend=%s", model_id, backend)
         return model, tokenizer, backend
+    finally:
+        _kompress_lock.release()
 
 
 def _load_kompress_pytorch(model_id: str, device: str = "auto") -> tuple[Any, Any, str]:
@@ -379,7 +399,16 @@ def _load_kompress_pytorch(model_id: str, device: str = "auto") -> tuple[Any, An
     import torch
     from transformers import AutoTokenizer
 
-    with _kompress_lock:
+    # Fast path: already loaded, no lock needed.
+    if model_id in _kompress_cache:
+        return _kompress_cache[model_id]
+
+    if not _kompress_lock.acquire(timeout=_KOMPRESS_LOAD_WAIT_TIMEOUT):
+        raise RuntimeError(
+            f"Kompress model {model_id!r} is being loaded by another thread; "
+            "skipping compression for this request"
+        )
+    try:
         if model_id in _kompress_cache:
             return _kompress_cache[model_id]
 
@@ -413,6 +442,8 @@ def _load_kompress_pytorch(model_id: str, device: str = "auto") -> tuple[Any, An
         _kompress_cache[model_id] = (model, tokenizer, "pytorch")
         logger.info("Kompress PyTorch loaded on %s (%s)", device, model_id)
         return model, tokenizer, "pytorch"
+    finally:
+        _kompress_lock.release()
 
 
 def _validate_pytorch_device(model: Any, tokenizer: Any, device: str) -> None:
@@ -547,6 +578,17 @@ class KompressConfig:
     model_id: str = HF_MODEL_ID
     chunk_words: int = 350
     score_threshold: float = 0.5
+    max_words: int = 4000
+    """Skip Kompress when content exceeds this word count.
+
+    Prevents cumulative inference time from exceeding the proxy's
+    compression timeout (COMPRESSION_TIMEOUT_SECONDS = 60).
+    With ONNX CPU at ~250ms/chunk and chunk_words=350:
+      4000 words → ~11 chunks → ~2.9s per content block
+      15 pending tasks × 2.9s = ~43s (within the 60s budget)
+
+    Set 0 to disable the limit (not recommended in proxy/latency-sensitive paths).
+    """
 
 
 @dataclass
@@ -585,9 +627,44 @@ class KompressCompressor(Transform):
         self.config = config or KompressConfig()
 
     def preload(self) -> str:
-        """Load the backing model/tokenizer and return the selected backend."""
+        """Load model and run a warm-up inference to trigger ONNX graph compilation.
 
-        _model, _tokenizer, backend = _load_kompress(self.config.model_id, self.config.device)
+        ONNX Runtime compiles the compute graph lazily on the first session.run()
+        call. On CPU this takes 60+ seconds for ModernBERT-base. Running a dummy
+        inference here ensures graph compilation happens at startup (before traffic
+        arrives) rather than on the first real request.
+        """
+        model, tokenizer, backend = _load_kompress(self.config.model_id, self.config.device)
+
+        # Warm-up: run one inference pass so ONNX Runtime compiles the graph now.
+        try:
+            import time as _time
+            t0 = _time.perf_counter()
+            is_onnx = backend == "onnx"
+            return_tensors = "np" if is_onnx else "pt"
+            # Use max_length=512 with padding="max_length" to force ONNX Runtime to
+            # compile the graph for the exact tensor shape used in actual inference.
+            # ONNX Runtime compiles per input shape; a 32-token warm-up would not
+            # cover the 512-token shape and the first real request would still block.
+            dummy_words = ["warm"] * 100
+            encoding = tokenizer(
+                dummy_words,
+                is_split_into_words=True,
+                truncation=True,
+                max_length=512,
+                padding="max_length",
+                return_tensors=return_tensors,
+            )
+            with _execution_semaphore(backend, _model_device_type(model, backend)):
+                model.get_keep_mask(encoding["input_ids"], encoding["attention_mask"])
+            logger.info(
+                "Kompress warm-up inference complete (%.1fs) backend=%s",
+                _time.perf_counter() - t0,
+                backend,
+            )
+        except Exception as exc:
+            logger.warning("Kompress warm-up inference failed (non-fatal): %s", exc)
+
         return backend
 
     def compress(
@@ -618,8 +695,20 @@ class KompressCompressor(Transform):
         if n_words < 10:
             return self._passthrough(content, n_words)
 
+        if self.config.max_words and n_words > self.config.max_words:
+            logger.debug(
+                "Kompress: skipping %d-word input (max_words=%d)",
+                n_words,
+                self.config.max_words,
+            )
+            return self._passthrough(content, n_words)
+
         try:
+            import threading as _threading
+            _tid = _threading.current_thread().name
+            logger.info("compress() START thread=%s n_words=%d model_id=%s", _tid, n_words, self.config.model_id)
             model, tokenizer, backend = _load_kompress(self.config.model_id, self.config.device)
+            logger.info("compress() model_loaded thread=%s backend=%s in_cache=%s", _tid, backend, self.config.model_id in _kompress_cache)
             is_onnx = backend == "onnx"
             device_type = _model_device_type(model, backend)
 
@@ -646,6 +735,7 @@ class KompressCompressor(Transform):
 
                 # ONNX uses numpy tensors, PyTorch uses torch tensors
                 return_tensors = "np" if is_onnx else "pt"
+                logger.info("compress() tokenizing chunk=%d/%d thread=%s", chunk_count, -(-n_words//max_chunk_words), _tid)
                 encoding = tokenizer(
                     chunk_words,
                     is_split_into_words=True,
@@ -658,6 +748,7 @@ class KompressCompressor(Transform):
                 input_ids = encoding["input_ids"]
                 attention_mask = encoding["attention_mask"]
                 word_ids = encoding.word_ids(batch_index=0)
+                logger.info("compress() acquiring_semaphore chunk=%d shape=%s thread=%s", chunk_count, list(input_ids.shape), _tid)
 
                 if not is_onnx:
                     device = next(model.parameters()).device
@@ -665,6 +756,7 @@ class KompressCompressor(Transform):
                     attention_mask = attention_mask.to(device)
 
                 with _execution_semaphore(backend, device_type):
+                    logger.info("compress() semaphore_acquired running_inference chunk=%d thread=%s", chunk_count, _tid)
                     inference_started = time.perf_counter()
                     if target_ratio is not None:
                         scores = model.get_scores(input_ids, attention_mask)
