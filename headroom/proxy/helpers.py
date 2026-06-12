@@ -669,10 +669,24 @@ def get_body_too_large_status() -> int:
     return value
 
 
-# Sentinel used by the SSE byte-buffer helper to mark events that have no
-# `event:` line. Per the SSE spec the default event name is "message"; we
-# return ``None`` so callers can decide whether to apply that default.
-_SSE_EVENT_TERMINATOR = b"\n\n"
+# SSE byte-buffer helper supports LF and CRLF event separators. Per the SSE
+# spec the default event name is "message"; we return ``None`` so callers can
+# decide whether to apply that default.
+_SSE_EVENT_TERMINATORS = (b"\n\n", b"\r\n\r\n")
+
+
+def _find_sse_event_terminator(buf: bytearray) -> tuple[int, int] | None:
+    """Return the earliest complete SSE event terminator in ``buf``."""
+    matches = [
+        (idx, len(terminator))
+        for terminator in _SSE_EVENT_TERMINATORS
+        if (idx := buf.find(terminator)) != -1
+    ]
+    if not matches:
+        return None
+    return min(matches, key=lambda match: match[0])
+
+
 _SSE_EVENT_LINE_PREFIX = b"event:"
 _SSE_DATA_LINE_PREFIX = b"data:"
 
@@ -718,20 +732,20 @@ def parse_sse_events_from_byte_buffer(
     multi-byte characters split across TCP reads will corrupt content.
     """
     events: list[tuple[str | None, str]] = []
-    terminator = _SSE_EVENT_TERMINATOR
     while True:
-        idx = buf.find(terminator)
-        if idx == -1:
+        terminator_match = _find_sse_event_terminator(buf)
+        if terminator_match is None:
             break
+        idx, terminator_len = terminator_match
         event_bytes = bytes(buf[:idx])
         # Drain the event + the trailing terminator from the buffer.
-        del buf[: idx + len(terminator)]
+        del buf[: idx + terminator_len]
         # Decoding the COMPLETE event must succeed. If it doesn't, the
         # upstream emitted invalid UTF-8 mid-stream — surface loudly.
         event_text = event_bytes.decode("utf-8")
         event_name: str | None = None
         data_lines: list[str] = []
-        for line in event_text.split("\n"):
+        for line in event_text.splitlines():
             if not line:
                 continue
             # SSE comment line — ignored per spec.
@@ -794,7 +808,8 @@ class CompressionFailureAction:
     reason: str
     """Short machine-readable label for telemetry. One of:
     ``timeout``, ``oversize:bytes=<n>>threshold=<m>``,
-    ``small_frame_transient``, or ``env_override:fail_open``."""
+    ``small_frame_transient``, ``client_override:codex``, or
+    ``env_override:fail_open``."""
 
     frame_bytes: int
     """Original frame size in bytes (for logging / metrics)."""
@@ -803,6 +818,8 @@ class CompressionFailureAction:
 def decide_compression_failure_action(
     exception: BaseException,
     frame_bytes: int,
+    *,
+    client: str | None = None,
 ) -> CompressionFailureAction:
     """Decide whether to refuse-and-close vs forward-original after the
     proxy's compression pipeline fails on a Realtime WebSocket frame
@@ -812,6 +829,10 @@ def decide_compression_failure_action(
 
     * env :data:`WS_COMPRESSION_FAIL_OPEN_ENV` truthy → forward (legacy
       behaviour, opt-in for debugging or strict compatibility).
+    * Codex client compression timeout → forward. Codex currently treats
+      the proxy's 1009/413 refusal path as a hard connection failure, so
+      fail-open is safer for Codex sessions even when the proxy is run
+      standalone rather than through ``headroom wrap codex``.
     * exception is :class:`asyncio.TimeoutError` → refuse (the compression
       stage hit its own timeout, which only fires on frames Headroom
       thought were big enough to need compression in the first place).
@@ -831,6 +852,13 @@ def decide_compression_failure_action(
         return CompressionFailureAction(
             refuse=False,
             reason="env_override:fail_open",
+            frame_bytes=frame_bytes,
+        )
+
+    if (client or "").strip().lower() == "codex" and isinstance(exception, asyncio.TimeoutError):
+        return CompressionFailureAction(
+            refuse=False,
+            reason="client_override:codex",
             frame_bytes=frame_bytes,
         )
 
@@ -937,6 +965,7 @@ def _setup_file_logging() -> None:
         # Disable propagation to root to avoid duplicate writes when
         # wrap.py redirects stderr to the same log file.
         headroom_logger = logging.getLogger("headroom")
+        headroom_logger.setLevel(logging.INFO)
         if not any(isinstance(h, RotatingFileHandler) for h in headroom_logger.handlers):
             headroom_logger.addHandler(handler)
         headroom_logger.propagate = False
@@ -1232,11 +1261,11 @@ def _read_context_tool_lifetime_stats(tool: str) -> dict[str, Any] | None:
     return _read_rtk_lifetime_stats()
 
 
-def initialize_context_tool_session_baseline() -> None:
+async def initialize_context_tool_session_baseline() -> None:
     """Pin the current context-tool counters as the proxy-session baseline."""
 
     tool = _selected_context_tool()
-    payload = _read_context_tool_lifetime_stats(tool)
+    payload = await asyncio.to_thread(_read_context_tool_lifetime_stats, tool)
     with _context_tool_stats_cache_lock:
         _context_tool_session_baseline.update(
             {
@@ -1260,10 +1289,10 @@ def initialize_context_tool_session_baseline() -> None:
         )
 
 
-def initialize_rtk_session_baseline() -> None:
-    """Pin the current context-tool counters as the proxy-session baseline."""
+async def initialize_rtk_session_baseline() -> None:
+    """Backward-compatible alias for initialize_context_tool_session_baseline."""
 
-    initialize_context_tool_session_baseline()
+    await initialize_context_tool_session_baseline()
 
 
 def _get_context_tool_stats() -> dict[str, Any] | None:
@@ -2289,11 +2318,14 @@ def apply_session_sticky_memory_tools(
             try:
                 tool_def = json.loads(golden_bytes.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                # Should never happen — golden bytes were produced by us.
-                # Loud failure per build constraint #4.
-                raise RuntimeError(
-                    f"corrupt golden tool bytes for session {session_id} tool {tool_name}: {exc}"
-                ) from exc
+                logger.error(
+                    "corrupt golden tool bytes for session %s tool %s: %s — skipping tool injection",
+                    session_id,
+                    tool_name,
+                    exc,
+                    exc_info=True,
+                )
+                continue
             tools_out.append(tool_def)
             existing_names.add(tool_name)
             replay_bytes += len(golden_bytes)
@@ -2569,21 +2601,24 @@ def apply_session_sticky_ccr_tool(
         if golden is not None:
             try:
                 tool_def = json.loads(golden.decode("utf-8"))
+                tools_out.append(tool_def)
+                log_tool_injection_decision(
+                    provider=provider,
+                    session_id=session_id,
+                    decision="inject_sticky_replay",
+                    tool_definition_bytes_count=len(golden),
+                    request_id=request_id,
+                )
+                return tools_out, True
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                # Should never happen — golden bytes were produced by us.
-                raise RuntimeError(
-                    f"corrupt golden CCR tool bytes for session {session_id}: {exc}"
-                ) from exc
-            tools_out.append(tool_def)
-            log_tool_injection_decision(
-                provider=provider,
-                session_id=session_id,
-                decision="inject_sticky_replay",
-                tool_definition_bytes_count=len(golden),
-                request_id=request_id,
-            )
-            return tools_out, True
-        # Tracker says "done CCR" but somehow has no golden bytes. Pin
+                logger.error(
+                    "corrupt golden CCR tool bytes for session %s: %s — regenerating fresh definition",
+                    session_id,
+                    exc,
+                    exc_info=True,
+                )
+                # Fall through to fresh creation below
+        # Tracker says "done CCR" but has no golden bytes (or they were corrupt). Pin
         # them now so future turns are stable.
         tool_def = create_ccr_tool_definition(provider)
         canonical = serialize_tool_definition_canonical(tool_def)
@@ -2806,3 +2841,112 @@ def compute_turn_id(
     h.update(b"\0")
     h.update(prefix_json.encode("utf-8", errors="replace"))
     return h.hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# Issue #746: Claude Code on-demand tool loading (deferral) detection
+#
+# When Claude Code points at a custom ``ANTHROPIC_BASE_URL`` (the proxy) with
+# ``ENABLE_TOOL_SEARCH`` unset, it stops deferring MCP/system tool schemas
+# behind the server-side Tool Search Tool and materializes them all into its
+# local context window — tens of K tokens. That decision is made client-side
+# before the request reaches us, so the proxy cannot reverse it; the only
+# remedy is the ``ENABLE_TOOL_SEARCH`` env var (set automatically by
+# ``headroom wrap claude``). For users who run ``claude`` manually we cannot
+# touch their environment, so the proxy emits a single actionable hint.
+# ---------------------------------------------------------------------------
+
+_TOOL_SEARCH_TOOL_TYPE_PREFIX = "tool_search_tool_"
+# Substrings of the ``anthropic-beta`` tokens that gate tool search:
+# ``advanced-tool-use-2025-11-20`` (firstParty/foundry) and
+# ``tool-search-tool-2025-10-19`` (vertex/bedrock/mantle/gateway).
+_TOOL_SEARCH_BETA_MARKERS = ("advanced-tool-use", "tool-search-tool")
+
+_tool_search_hint_lock = threading.Lock()
+_tool_search_hint_emitted = False
+
+
+def claude_code_tool_search_inactive(
+    *,
+    client: str | None,
+    tools: Any,
+    anthropic_beta: str | None,
+) -> bool:
+    """Return ``True`` when a Claude Code request is *not* deferring tools.
+
+    Detected from request shape alone — no token thresholds, so it scales to
+    any tool surface:
+
+    * the request is from Claude Code (``client == "claude-code"``),
+    * it carries one or more tool definitions, yet
+    * it includes neither a ``tool_search_tool_*`` tool nor a tool-search
+      ``anthropic-beta`` token.
+
+    In that combination Claude Code has eagerly materialized every tool schema
+    into its local context window (issue #746).
+    """
+    if client != "claude-code":
+        return False
+    if not isinstance(tools, list) or not tools:
+        return False
+    for tool in tools:
+        if isinstance(tool, dict) and str(tool.get("type", "")).startswith(
+            _TOOL_SEARCH_TOOL_TYPE_PREFIX
+        ):
+            return False
+    beta = (anthropic_beta or "").lower()
+    return not any(marker in beta for marker in _TOOL_SEARCH_BETA_MARKERS)
+
+
+def format_tool_search_disabled_hint(tools: list[Any]) -> str:
+    """Build the one-time, actionable hint for issue #746.
+
+    Reports factual, directional numbers (tool count and serialized schema
+    size) rather than a derived token estimate, which avoids implying a
+    precision the proxy cannot measure for the client's tokenizer.
+    """
+    try:
+        schema_kb = len(json.dumps(tools, separators=(",", ":"), default=str)) / 1024
+    except (TypeError, ValueError):
+        schema_kb = 0.0
+    return (
+        f"Claude Code is sending all {len(tools)} tool definitions eagerly "
+        f"(~{schema_kb:.0f} KB of tool schema in local context) because "
+        "ENABLE_TOOL_SEARCH is unset with a custom ANTHROPIC_BASE_URL. Set "
+        "ENABLE_TOOL_SEARCH=true (or auto) to keep on-demand tool loading active, "
+        "or launch via `headroom wrap claude` (which sets it automatically). "
+        "See https://github.com/chopratejas/headroom/issues/746"
+    )
+
+
+def tool_search_hint_pending() -> bool:
+    """Cheap, lock-free check of whether the one-time hint may still fire.
+
+    Lets the request hot path skip the (O(number-of-tools)) detection scan on
+    every request once the hint has already been emitted. A benign race here
+    only costs one extra detection scan, never a duplicate warning — the
+    actual one-shot guarantee lives in :func:`take_tool_search_hint_slot`.
+    """
+    return not _tool_search_hint_emitted
+
+
+def take_tool_search_hint_slot() -> bool:
+    """Return ``True`` exactly once per process, gating the one-time hint.
+
+    Thread-safe so concurrent requests cannot each emit the warning.
+    """
+    global _tool_search_hint_emitted
+    if _tool_search_hint_emitted:
+        return False
+    with _tool_search_hint_lock:
+        if _tool_search_hint_emitted:
+            return False
+        _tool_search_hint_emitted = True
+        return True
+
+
+def reset_tool_search_hint_state() -> None:
+    """Reset the one-time hint guard. Test helper only."""
+    global _tool_search_hint_emitted
+    with _tool_search_hint_lock:
+        _tool_search_hint_emitted = False

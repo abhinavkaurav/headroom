@@ -48,6 +48,11 @@ class RequestLog:
 
     # Request/Response (optional, for debugging)
     request_messages: list[dict] | None = None
+    # Messages after compression, as actually sent upstream. Paired with
+    # `request_messages` (the pre-compression snapshot) so consumers can diff
+    # the two sides of the compression. Governed by the same
+    # `log_full_messages` gate as `request_messages`.
+    compressed_messages: list[dict] | None = None
     response_content: str | None = None
     error: str | None = None
 
@@ -96,6 +101,7 @@ class ProxyConfig:
     openai_api_url: str | None = None  # Custom OpenAI API URL override
     gemini_api_url: str | None = None  # Custom Gemini API URL override
     cloudcode_api_url: str | None = None  # Custom Cloud Code Assist API URL override
+    vertex_api_url: str | None = None  # Custom Vertex AI regional API URL override
 
     # Backend: "anthropic" (direct API), "litellm-*" (via LiteLLM), or "anyllm" (via any-llm)
     backend: str = "anthropic"
@@ -112,11 +118,16 @@ class ProxyConfig:
     image_optimize: bool = True
     min_tokens_to_crush: int = 500
     max_items_after_crush: int = 50
+    smart_crusher_with_compaction: bool | None = None
     keep_last_turns: int = 4
 
     # CCR Tool Injection
     ccr_inject_tool: bool = True
     ccr_inject_system_instructions: bool = False
+    # Proxy-level mirror of ContentRouterConfig.ccr_inject_marker, so retrieval
+    # markers can be toggled from the CLI (--no-ccr-marker). Threaded into the
+    # router in server.py; default preserves current behavior.
+    ccr_inject_marker: bool = True
 
     # CCR Response Handling
     ccr_handle_responses: bool = True
@@ -129,6 +140,11 @@ class ProxyConfig:
 
     # Code-aware compression (disabled by default — use code graph tools instead)
     code_aware_enabled: bool = False
+
+    # Disable Kompress ML compression while keeping structural compressors
+    # such as SmartCrusher, log/search/diff, and schema compaction enabled.
+    # CLI: --disable-kompress; env: HEADROOM_DISABLE_KOMPRESS=1.
+    disable_kompress: bool = False
 
     # Code graph live watcher (triggers incremental reindex on file changes)
     code_graph_watcher: bool = False
@@ -143,6 +159,14 @@ class ProxyConfig:
     # router would otherwise have nothing eligible to compress.
     # CLI: --compress-user-messages; env: HEADROOM_COMPRESS_USER_MESSAGES=1.
     compress_user_messages: bool = False
+    # Named savings policy shared across Claude/Codex/Cursor proxy handlers.
+    # CLI/env: HEADROOM_SAVINGS_PROFILE=agent-90.
+    savings_profile: str | None = None
+    target_ratio: float | None = None
+    compress_system_messages: bool | None = None
+    protect_recent: int | None = None
+    protect_analysis_context: bool | None = None
+    accuracy_guard: str | None = None
 
     # Extra tool names whose outputs are never compressed, merged with the
     # built-in DEFAULT_EXCLUDE_TOOLS. None means built-in defaults only.
@@ -240,7 +264,7 @@ class ProxyConfig:
     memory_qdrant_api_key: str | None = field(default_factory=qdrant_env.qdrant_env_api_key)
     memory_neo4j_uri: str = "neo4j://localhost:7687"
     memory_neo4j_user: str = "neo4j"
-    memory_neo4j_password: str = "password"
+    memory_neo4j_password: str = ""
     memory_bridge_enabled: bool = False
     memory_bridge_md_paths: list[str] = field(default_factory=list)
     memory_bridge_md_format: str = "auto"
@@ -311,6 +335,10 @@ class ProxyConfig:
     # ``HeadroomProxy._run_compression_in_executor``.
     compression_max_workers: int | None = None
 
+    def __post_init__(self, smart_routing: bool | None = None) -> None:
+        if self.retry_enabled and self.retry_max_attempts < 1:
+            raise ValueError("retry_max_attempts must be >= 1 when retry_enabled=True")
+
     @property
     def provider_api_overrides(self) -> ProviderApiOverrides:
         """Return provider API URL overrides as a dedicated provider config object."""
@@ -319,4 +347,5 @@ class ProxyConfig:
             openai=self.openai_api_url,
             gemini=self.gemini_api_url,
             cloudcode=self.cloudcode_api_url,
+            vertex=self.vertex_api_url,
         )

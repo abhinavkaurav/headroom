@@ -112,7 +112,6 @@ for memory in results:
 # Add a memory manually
 client.memory.add(
     "User is a senior engineer",
-    category="fact",
     importance=0.9,
 )
 
@@ -174,10 +173,11 @@ This gives you an audit trail, the ability to debug why the LLM made certain dec
 ```python
 from headroom.memory import MemoryConfig, EmbedderBackend
 
-# Local embeddings (recommended -- fast, free, private)
+# ONNX embeddings (recommended -- fast, free, private; ~30 MB int8-quantized)
+# Note: EmbedderBackend.LOCAL requires PyTorch (~2 GB); use ONNX instead.
 config = MemoryConfig(
-    embedder_backend=EmbedderBackend.LOCAL,
-    embedder_model="all-MiniLM-L6-v2",
+    embedder_backend=EmbedderBackend.ONNX,
+    embedder_model="BAAI/bge-small-en-v1.5",
 )
 
 # OpenAI embeddings (higher quality, costs money)
@@ -194,6 +194,36 @@ config = MemoryConfig(
     embedder_model="nomic-embed-text",
 )
 ```
+
+### Embedding Runtime / GPU Offload (Apple Silicon)
+
+By default the proxy's memory embedder runs on the **ONNX CPU** backend -- fast
+and dependency-light, but CPU-only. Under sustained load the embedding step can
+saturate the CPU and make the proxy less responsive.
+
+On Apple Silicon you can opt in to running the embedder on the **Apple GPU
+(MPS)** instead, which offloads that work off the CPU and keeps the proxy
+responsive. Install the extra and set the env var:
+
+```bash
+pip install "headroom-ai[pytorch-mps]"   # also works as [pytorch_mps]
+export HEADROOM_EMBEDDER_RUNTIME=pytorch_mps
+```
+
+When set, the embedder runs via the torch sentence-transformers backend on the
+Apple GPU instead of the default ONNX CPU embedder. Notes:
+
+- **Strictly opt-in.** `pytorch_mps` is the only accepted value; anything else
+  (or unset) keeps the default ONNX CPU embedder. Default behavior is unchanged,
+  and there is no CLI flag -- it is env-var only.
+- **Auto-fallback.** It only activates when Apple MPS is actually available
+  (Apple Silicon + torch). If MPS is unavailable or torch/sentence-transformers
+  is not installed, it logs a warning and uses the existing default embedder
+  selection path: ONNX when available, then the pre-existing local
+  sentence-transformers fallback.
+- **MPS serialization.** torch-MPS is not thread-safe, so the embedder
+  serializes MPS encode calls internally via a single-worker executor. This is
+  automatic -- there is nothing to configure.
 
 ### Storage
 
